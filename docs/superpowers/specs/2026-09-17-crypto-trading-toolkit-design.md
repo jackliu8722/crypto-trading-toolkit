@@ -105,6 +105,8 @@ struct OrderIntent {
     objective:      Objective,
     constraints:    Constraints,       // 只能收紧
     profile:        Option<ProfileRef>,// 授权过的命名执行配置
+    valid_until:    Timestamp,         // 意图级有效期
+    on_deadline:    DeadlineAction,    // 到期未完成时的处置，必须显式选择
     dry_run:        bool,
 }
 
@@ -153,11 +155,95 @@ enum Objective {
 
 `exposure_group` 决定风控如何聚合风险：同一组内的腿按对冲后的净敞口评估；不声明则被当作独立风险，额度按 `|腿A| + |腿B|` 占用而非 `|腿A − 腿B|`。
 
-返回 `ExecutionHandle`：查询进度、请求取消、订阅成交流。
+### 3.2 提交结果
 
-gRPC：`SubmitIntent / CancelIntent / GetTask / StreamFills / StreamProgress`，以及**单独授权**的 `Admin`（KillSwitch / Suspend / EmergencyFlatten）。
+`submit` 同步完成准入校验与初始风控，返回四态结果：
 
-### 3.2 取消语义
+```rust
+enum SubmitOutcome {
+    Accepted(ExecutionHandle),       // 已接受为执行任务；成交异步进行
+    Rejected(Rejection),             // 明确拒绝，未产生任何任务
+    OutcomeUnknown(IntentId),        // 提交结果未知
+    Conflict(IdempotencyConflict),   // 相同 ID 但内容不同
+}
+```
+
+**`Accepted` 不代表已成交、不代表子单已发出**，只代表意图通过准入与初始风控并被持久化。这与 P1 一致：既不把"不知道"压缩成"失败"，也不把"已接受"膨胀成"已成交"。
+
+**`OutcomeUnknown` 时业务只能用同一 `IntentId` 查询，禁止换 ID 重发**——换 ID 重发是重复下单的主要来源。恢复方式见 §3.3 的 `find_by_intent`。
+
+gRPC 对应 `SubmitIntentResponse`，同一套语义，不做二次映射。
+
+### 3.3 客户端与执行句柄
+
+```rust
+impl ExecutionClient {
+    /// 从幂等键恢复句柄 —— OutcomeUnknown 后的唯一安全恢复方式
+    async fn find_by_intent(&self, intent_id: IntentId) -> Result<Option<ExecutionHandle>>;
+}
+
+impl ExecutionHandle {
+    fn task_id(&self) -> TaskId;
+
+    /// 当前一致快照；始终是权威数据来源
+    async fn get_task(&self) -> Result<TaskSnapshot>;
+
+    /// 等待进入终态
+    async fn wait_terminal(&self, timeout: Option<Duration>) -> Result<TaskSnapshot>;
+
+    /// 请求取消；返回不代表已撤单（见 §3.5）
+    async fn request_cancel(&self, reason: CancelReason) -> Result<CancelReceipt>;
+
+    async fn stream_fills(&self) -> Result<impl Stream<Item = FillEvent>>;
+    async fn stream_progress(&self) -> Result<impl Stream<Item = ProgressEvent>>;
+}
+```
+
+### 3.4 任务快照
+
+```rust
+struct TaskSnapshot {
+    task_id:      TaskId,
+    intent_id:    IntentId,
+    revision:     Revision,          // 快照版本
+    status:       TaskStatus,        // Working | Canceling | PartiallyFilled | Filled | Canceled | Expired | Failed
+    cancel_state: CancelState,       // None | Requested | Confirmed
+    legs:         Vec<LegSnapshot>,
+    fills:        Vec<Fill>,
+    errors:       Vec<TaskError>,
+    as_of:        Timestamp,         // 快照生成时刻
+}
+
+struct LegSnapshot {
+    leg_index:       u8,
+    route:           RouteId,
+    target:          Delta,          // 目标增量
+    filled:          Delta,          // 已成交
+    remaining:       Delta,
+    avg_price:       Option<Price>,  // 无成交时为 None，不是零
+    status:          LegStatus,
+    working_orders:  u32,            // 在途订单
+    unknown_orders:  u32,            // 未知结果订单
+}
+
+struct Fill {
+    leg_index:      u8,
+    child_order_id: ClientOrderId,
+    venue_order_id: Option<VenueOrderId>,
+    price:          Price,
+    quantity:       Quantity,        // 原生单位
+    fee:            Option<Amount>,  // None = 未知；Some(0) = 明确为零
+    exchange_time:  Timestamp,
+    received_time:  Timestamp,
+}
+```
+
+两条容易被忽略但必须遵守的规则：
+
+- **`None` 与零必须区分**：`fee: None` 是费用未知，`Some(0)` 是明确无费用。把未知当零会**静默低估成本**，是执行质量数据失真的头号原因。
+- **`unknown_orders` 必须对业务可见**：它是判断真实风险敞口的依据。把它藏在内部等于让业务基于不完整信息做决策，违背 P1。
+
+### 3.5 取消语义
 
 `CancelReceipt` 只表示**取消请求被接受**，不代表订单已撤销、Task 已终态或风险已清除。
 
@@ -165,11 +251,136 @@ gRPC：`SubmitIntent / CancelIntent / GetTask / StreamFills / StreamProgress`，
 - 已发送、在途、结果未知的订单继续归集回报；**迟到成交仍计入，不得因取消而丢弃**；
 - **不能仅凭取消请求释放风险预留**。
 
-### 3.3 幂等
+确认取消真正完成：轮询 `get_task` 直到 `status` 进入终态，或用 `wait_terminal`。**除终态外没有中间可信状态。**
 
-幂等作用域为 `(OwnerScope, IntentId)`。相同 ID 相同内容 → 返回同一 Task；相同 ID 不同内容 → `IdempotencyConflict`。
+### 3.6 幂等
+
+幂等作用域为 `(OwnerScope, IntentId)`。相同 ID 相同内容 → 返回同一 Task；相同 ID 不同内容 → `Conflict`。
 
 请求摘要由 `ctt` 对解码后的语义模型计算，**业务提供的摘要不权威**。子单 `client_order_id` 由 `(owner, intent_id, leg, 分片序号)` 确定性生成，保证重启重连后不重复下单。
+
+### 3.7 错误分类
+
+按**业务该做什么**分类，不按内部模块分类：
+
+| 错误 | 含义 | 业务动作 |
+| --- | --- | --- |
+| `InvalidRequest` | 参数或语义不合法 | 修正后重发，**不可沿用同一 ID** |
+| `CapabilityUnsupported` | 交易所或账户不支持该能力 | 换能力或换路由 |
+| `RiskRejected(RiskReason)` | 风控拒绝 | 调整意图或申请授权 |
+| `QuotaExceeded` | 额度不足 | 释放额度后重试 |
+| `SystemNotReady` | 对账中 / 所有权丢失 / 系统降级 | **可安全重试** |
+| `OutcomeUnknown` | 提交结果未知 | **只能用同一 ID 查询，禁止换 ID 重发** |
+
+### 3.8 其他调用语义
+
+**有效期与到期行为**。`valid_until` 是意图级有效期，`leg.deadline` 是单腿更早的额外约束（可选）。到达截止时间仍未完成时按 `on_deadline` 处置：
+
+| `DeadlineAction` | 行为 |
+| --- | --- |
+| `CancelRest` | 撤销未完成部分，保留已成交 |
+| `CompleteAggressively` | 放宽紧迫度追完剩余（**仍受价格保护上限约束**） |
+| `KeepWorking` | 继续按原节奏挂单 |
+
+**必须由业务显式选择，不设默认值**——三种行为对应的资金后果完全不同，替业务选就是替业务承担风险。
+
+**`dry_run`**。完整执行准入校验、风控评估、算法切片与价格保护计算，**但不发送任何命令、不产生持久化任务**；返回执行计划（切片数、各片预测量、预估成本）与风控结论。**不保证与真实成交一致，不得用于成本核算。**
+
+**并发提交**。同一账户的多个意图可并发提交，风控预留串行化执行（§9）。额度按提交顺序竞争，不足时返回 `QuotaExceeded`。意图之间互不阻塞，但可能因额度竞争被拒。
+
+**流与快照**。流用于实时感知，**快照是唯一权威**。订阅中断后重新 `get_task` 拉取一致快照来补齐，**首期不提供流的断点续传**（见 §11）。
+
+### 3.9 端到端示例
+
+两腿合约对冲（BTC 永续多 + ETH 永续空，同一 PM 账户）：
+
+```rust
+use anyhow::anyhow;
+use ctt_api::{ExecutionClient, OrderIntent, Leg, LegDelta, PositionSide,
+              PriceGuard, Objective, Constraints, FailurePolicy,
+              DeadlineAction, ProfileRef, ExposureGroupId,
+              OwnerScope, RouteId, ContractDelta, Notional};
+
+let intent = OrderIntent {
+    intent_id:      IntentId::new("hedge-20260917-001")?,
+    owner:          OwnerScope { account: "pm-main".into(), strategy: "basis-arb".into() },
+    exposure_group: ExposureGroupId::new("btc-eth-basis-001")?,
+
+    legs: vec![
+        Leg {
+            route:       RouteId::from("binance-pm-perp-btc"),
+            delta:       LegDelta::ContractPosition {
+                position_side:  PositionSide::Long,
+                contract_delta: ContractDelta::from_str("1.5")?,   // 开多 1.5 张
+            },
+            price_guard: PriceGuard::MaxSlippageBps(10),
+            deadline:    None,
+        },
+        Leg {
+            route:       RouteId::from("binance-pm-perp-eth"),
+            delta:       LegDelta::ContractPosition {
+                position_side:  PositionSide::Short,
+                contract_delta: ContractDelta::from_str("-30")?,   // 开空 30 张
+            },
+            price_guard: PriceGuard::MaxSlippageBps(10),
+            deadline:    None,
+        },
+    ],
+
+    objective:   Objective::PairedCompletion,   // 优先两腿同步，最小化单边裸敞口
+    constraints: Constraints {
+        max_temp_exposure: Some(Notional::from_str("50000")?),
+        failure_policy:    FailurePolicy::Compensate(Compensation::UnwindFilledLeg),
+        ..Default::default()
+    },
+    profile:     Some(ProfileRef::from("hedge-perp-ioc-v1")),
+    valid_until: deadline,
+    on_deadline: DeadlineAction::CancelRest,
+    dry_run:     false,
+};
+
+// 提交：同步返回四态之一
+let handle = match client.submit(intent).await? {
+    SubmitOutcome::Accepted(h)   => h,
+    SubmitOutcome::Rejected(r)   => return Err(anyhow!("rejected: {r:?}")),
+    SubmitOutcome::Conflict(c)   => return Err(anyhow!("idempotency conflict: {c:?}")),
+    SubmitOutcome::OutcomeUnknown(id) => {
+        // 关键：只能用同一 ID 恢复，禁止换 ID 重发
+        client.find_by_intent(id).await?
+            .ok_or(anyhow!("cannot resolve unknown outcome for {id}"))?
+    }
+};
+
+// 实时感知（快照始终是权威，流只用于及时性）
+let mut fills = handle.stream_fills().await?;
+tokio::spawn(async move {
+    while let Some(fill) = fills.next().await {
+        tracing::info!(leg = fill.leg_index, price = %fill.price, qty = %fill.quantity, "fill");
+    }
+});
+
+// 等待终态并核对每腿真实进度
+let snap = handle.wait_terminal(None).await?;
+for leg in &snap.legs {
+    println!("leg {}: filled={} remaining={} avg={:?} unknown_orders={}",
+        leg.leg_index, leg.filled, leg.remaining, leg.avg_price, leg.unknown_orders);
+}
+```
+
+对应 gRPC：
+
+```protobuf
+service Execution {
+  rpc SubmitIntent(SubmitIntentRequest)      returns (SubmitIntentResponse);   // 内含 outcome 四态
+  rpc FindByIntent(FindByIntentRequest)      returns (TaskSnapshot);
+  rpc GetTask(GetTaskRequest)                returns (TaskSnapshot);
+  rpc CancelIntent(CancelIntentRequest)      returns (CancelReceipt);
+  rpc StreamFills(StreamFillsRequest)        returns (stream FillEvent);
+  rpc StreamProgress(StreamProgressRequest)  returns (stream ProgressEvent);
+}
+```
+
+**单独授权**的 Admin 接口不在此 service 内：`KillSwitch / Suspend / EmergencyFlatten / ForceTakeover`（见 §11）。
 
 ---
 
@@ -422,13 +633,15 @@ sim → {venue, core}
 
 ## 11. 对外接口
 
-- **Rust crate**：`ExecutionHandle`（同进程）。公共 trait 最小化：提交 / 查询 / 取消 / 订阅。
-- **gRPC**：`tonic` + `prost`，`proto/ctt.proto`；服务端只做鉴权、参数绑定与转发。
+**方法契约与数据结构以 §3 为准，本节只规定传输层特有的约束**，避免两处各写一份而逐渐分叉。
+
+- **Rust crate**：同进程直接调用，无序列化开销；公共接口最小化——提交、按幂等键恢复、查询、取消、订阅。
+- **gRPC**：`tonic` + `prost`，`proto/ctt.proto` 是对外语义的权威定义；protobuf 消息与 §3.4 的 Rust 结构一一对应。服务端只做鉴权、参数绑定与转发，**禁止写业务逻辑**。
 - 聚合门面可以提供，但**不得把传输层类型泄漏进业务语义**。
 - **实时流首期提供**：`StreamFills` 推送实时成交，`StreamProgress` 推送任务进度；订阅中断不隐含取消 Task。
 - **历史事件回放延后**：不提供 `watch_task(after)`、游标续订或历史 Task 事件回放。只有真实消费者需要逐条补齐遗漏事件时，才单独设计事件版本、授权、保留期与重复/缺口处理。
 - Admin 能力（熔断、暂停、紧急平仓、强制接管）**单独授权**，不进入普通调用接口。
-- 本地（同进程）与远程（gRPC）共享业务语义，但**网络故障语义不同**：远程超时表示结果未知，不表示拒绝，也不表示 Task 不存在。
+- **本地与远程共享业务语义，但故障语义不同**：远程超时表示结果未知（`OutcomeUnknown`），不表示拒绝，也不表示 Task 不存在。**客户端库不得把远程超时翻译成本地错误**，否则业务会误判为重发时机。
 
 ---
 
