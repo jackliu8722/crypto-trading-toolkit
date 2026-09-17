@@ -126,7 +126,7 @@ Binance 现货 + U 本位永续；普通账户与 Portfolio Margin；自营资�
 
 ### 3.4 风险与授权边界
 
-- 所有实盘命令必须经过：`TaskCoordinator 提议 → AccountSupervisor 串行化并预留 → 持久化 Outbox → CommandGate 批准 → Adapter 传输`。**不得为恢复或撤单建立 Adapter 旁路。**
+- 所有实盘命令必须经过：`算法/协调器 提议动作 → 风控串行化并预留 → 持久化日志与发件箱 → 发送闸门最终批准 → 交易所传输`。**不得为恢复或撤单建立旁路。**
 - 约束只能收紧：`Requested ∩ 授权 ∩ 风险策略 ∩ 生产授权 = Effective Constraints`。
 - PM 风险必须在**账户级**评估，不能只看当前 Task 的腿；**禁止跨 margin domain 净额计算保证金**。
 - 交易所风险证据、本地保证金估算、经济敞口三者必须区分，**不得把估算伪装成交易所事实**。
@@ -145,9 +145,9 @@ Binance 现货 + U 本位永续；普通账户与 Portfolio Margin；自营资�
 算法按正交维度组合，**不要每种算法写一个大类**：
 
 ```
-Coordinator(Single|HedgeSaga) × Slicer(Fixed|TWAP|VWAP|POV)
-× ChildOrderPolicy(BoundedIOC|Iceberg|MakerFirst|Chase)
-× Urgency × PriceGuard × FailurePolicy
+协调器(单腿|两腿对冲) × 切片器(Fixed|TWAP|VWAP|POV)
+× 子单策略(BoundedIOC|Iceberg|MakerFirst|Chase)
+× 紧迫度 × 价格保护 × 失败策略
 ```
 
 每个算法必须明确：输入意图、优化目标与优先级、约束（时间窗/价格保护/参与率/最大重试）、行情过期与深度不足时的行为、部分成交与尾量处理、撤单与成交竞态处理、可解释的基准。
@@ -206,36 +206,53 @@ Coordinator(Single|HedgeSaga) × Slicer(Fixed|TWAP|VWAP|POV)
 ## 6. 架构与依赖边界
 
 ```
-proto/ctt.proto              gRPC 契约（权威数据源）
+proto/ctt.proto      gRPC 契约（对外语义的权威定义）
 crates/
-  ctt-domain                 数值、单位、身份、时间、品种、账户事实
-  ctt-tools                  规则/舍入、盘口、费用、基差、能力检查
-  ctt-adapter-spi            能力、命令、结果、查询、证据、流、屏障、端口
-  ctt-execution              纯执行核心：Input/Context、Child、Slicing、ChildPolicy、Leg、Group、Route、Exposure
-  ctt-adapter-binance        认证/签名/限频/WS/命令翻译/证据
-  ctt-runtime                Journal/Outbox、AccountSupervisor、预留、CommandGate、对账、生命周期
-  ctt-api                    Rust 门面 + gRPC 服务
-  ctt-testkit / ctt-tca      确定性时钟与脚本时间线 / 基准与分项报告
-apps/ctt-server  apps/ctt-cli
+  ctt-core            精确数值、单位类型、时间语义、标识符、错误分类、领域模型
+  ctt-venue           交易所抽象：trait、能力声明、限频、重试、时间同步、流重连
+  ctt-binance         Binance 实现：签名、三种账户模式、命令翻译、结果证据
+  ctt-market          行情与订单簿：快照+增量、连续性校验、新鲜度、盘口估算
+  ctt-oms             订单与任务管理：状态机、幂等、日志与发件箱、对账、恢复
+  ctt-algo            执行算法：切片器、子单策略、路由与对冲协调
+  ctt-risk            风控：限额、风险预留、价格保护、熔断
+  ctt-api             Rust 门面 + gRPC 服务实现
+  ctt-sim             paper trading、撮合模拟、录制回放
+apps/
+  ctt-server          gRPC 服务二进制
+  ctt-cli             运维与手动干预工具
 ```
 
-**依赖严格单向**：`api → runtime → {execution, adapter-spi, tools, domain}`；`adapter-binance → adapter-spi + domain`。
+**依赖严格单向**：
+
+```
+api → oms → {algo, risk, market, venue}
+algo → {market, risk, core}
+risk → {market, core}
+market → {venue, core}
+binance → {venue, core}
+sim → {venue, core}
+```
+
+`core` 不依赖任何上层。
 
 各层禁止事项：
 
 | 层 | 禁止 |
 | --- | --- |
-| 纯执行核心 | 访问网络、读数据库、读系统墙上时间、直接调用 Adapter |
-| Adapter | 拥有业务 Task、多腿协调、账户风险裁决、成为 Runtime 旁路 |
-| `ctt-api` | 写业务逻辑（只做鉴权、绑定与转发） |
+| `ctt-algo` | 直接调用交易所写接口（只能通过 `oms` 提供的受控端口） |
+| `ctt-binance` | 拥有业务 Task、多腿协调、账户风险裁决 |
+| `ctt-api` | 写业务逻辑（只做鉴权、参数绑定与转发） |
+| `ctt-market` | 下单决策以外的任何写操作 |
 
 发现需要反向依赖 = 抽象位置错了，回来改结构；**不得用 `#[cfg]` 或 `Arc<dyn>` 绕过**。
+
+首期不建独立的能力契约层（只有一个交易所实现时属过度设计）；`ctt-venue` 的 trait 存在的首要理由是让 `ctt-sim` 能提供可替换的假实现，而非为假想的多交易所预留。
 
 ---
 
 ## 7. Binance 适配陷阱
 
-改 `ctt-adapter-binance` 必读：
+改 `ctt-binance` 必读：
 
 1. **限频是权重制**：`REQUEST_WEIGHT`(1min 滑窗) + `ORDERS` 双维度；必须读 `x-mbx-used-weight-1m` 做反馈式动态限流；**为撤单与风控动作预留下单额度**。
 2. **三种账户模式端点不同**：Spot `/api/v3/*`、UM Futures `/fapi/v1/*`、**PM `/papi/v1/*`**；同一 key 只属一种模式，启动时探测校验，不匹配 fail-fast。
@@ -385,22 +402,23 @@ cargo build --release --locked --offline
 
 | 要改的东西 | 先读 |
 | --- | --- |
-| 下单/状态机/幂等 | `crates/ctt-runtime/src/command_gate.rs`、`crates/ctt-execution/src/child/` |
-| 算法 | `crates/ctt-execution/src/slicing/`、`crates/ctt-execution/src/ioc/` |
-| 风控与预留 | `crates/ctt-runtime/src/account_supervisor/`、`crates/ctt-execution/src/exposure/` |
-| 交易所接入 | `crates/ctt-adapter-spi/src/`（能力/命令/结果/证据/屏障）+ `docs/binance-pm-notes.md` |
+| 下单/状态机/幂等 | `crates/ctt-oms/src/`、`crates/ctt-risk/src/gate.rs` |
+| 算法 | `crates/ctt-algo/src/slicer/`、`crates/ctt-algo/src/child_policy/` |
+| 风控与预留 | `crates/ctt-risk/src/` |
+| 交易所接入 | `crates/ctt-venue/src/`（trait 与能力声明）+ `docs/binance-pm-notes.md` |
+| 行情与订单簿 | `crates/ctt-market/src/` |
 | 对外接口 | `proto/ctt.proto` |
-| 持久化与对账 | `crates/ctt-runtime/src/journal/`、`crates/ctt-adapter-spi/src/barrier.rs` |
+| 持久化与对账 | `crates/ctt-oms/src/journal/`、`crates/ctt-oms/src/reconcile.rs` |
 
 ### 13.2 SOP
 
 | 任务 | 步骤 |
 | --- | --- |
 | 新增算法 | 实现 `Slicer` 或 `ChildOrderPolicy` → 注册 `ProfileRef` → 补属性测试（总量守恒、不超价、不超参与率）→ 补确定性场景 → 补 TCA 基准 |
-| 新增风控规则 | 实现 `RiskRule` → 在 CommandGate 前注册 → 补默认阈值与单测 → 更新设计文档规则表 |
+| 新增风控规则 | 实现 `RiskRule` → 在发送闸门注册 → 补默认阈值与单测 → 更新设计文档规则表 |
 | 新增交易所/账户模式 | 实现 Adapter SPI → 补齐能力声明与数量映射 → 补对账屏障 → 补契约测试 |
 | 新增对外接口 | 先改 `proto/ctt.proto` → 生成代码 → 在 runtime 实现逻辑；**禁止在 `ctt-api` 写业务逻辑** |
-| 改任何下单路径 | 同时确认：是否经 AccountSupervisor 预留、是否落 Outbox、是否幂等、超时是否进 Unknown、是否有确凿证据才重发 |
+| 改任何下单路径 | 同时确认：是否经风控预留、是否落持久化日志与发件箱、是否幂等、超时是否进 Unknown、是否有确凿证据才重发 |
 
 ---
 
