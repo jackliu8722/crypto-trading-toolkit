@@ -105,9 +105,10 @@ struct OrderIntent {
     objective:      Objective,
     constraints:    Constraints,       // 只能收紧
     profile:        Option<ProfileRef>,// 授权过的命名执行配置
-    valid_until:    Timestamp,         // 意图级有效期
-    on_deadline:    DeadlineAction,    // 到期未完成时的处置，必须显式选择
-    dry_run:        bool,
+    target_completion: Option<Timestamp>, // 软目标：尽力在此之前完成
+    hard_deadline:     Timestamp,         // 硬截止：到达后不再发起新子单
+    on_deadline:       DeadlineAction,    // 软目标未达成时的处置，必须显式选择
+    dry_run:           bool,
 }
 
 struct Leg {
@@ -143,13 +144,18 @@ enum Objective {
 }
 ```
 
-`contract_delta` 的方向语义依赖 `position_side`：
+`contract_delta` 一律解释为**对该槽位的增减**，符号**不**表示买卖方向：
 
-| 持仓模式 | 开仓 | 平仓 |
+| 持仓模式 | 增量符号 | 含义 |
 | --- | --- | --- |
-| `Net` | 正为开多、负为开空 | 反向增量 |
-| `Long` | 正为增加多仓 | 负为减少多仓 |
-| `Short` | 正为增加空仓（数值为负更直观，但符号由槽位决定方向） | 负为减少空仓 |
+| `Net` | 正 | 净仓向多头方向移动 |
+| `Net` | 负 | 净仓向空头方向移动 |
+| `Long` | 正 | 开多 / 加多 |
+| `Long` | 负 | 减多 / 平多 |
+| `Short` | 正 | **开空 / 加空** |
+| `Short` | 负 | 减空 / 平空 |
+
+**槽位增减到买卖方向的映射由 `ctt` 负责**（例如双向持仓账户中 `Short` 槽的正增量对应卖出）。业务只需表达"增加还是减少某个槽位"，**不应自行推导买卖方向**——这正是最容易搞反的地方：直觉上"开空"像卖出所以想写负号，但在本契约里它是 `Short` 槽的正增量。
 
 **`position_side` 必须与账户实际持仓模式匹配**：单向持仓账户提交 `Long`/`Short` 会被直接拒绝，双向持仓账户提交 `Net` 同样被拒绝。启动时探测校验，提交时再次校验——**不静默适配，不猜测业务意图**。
 
@@ -157,20 +163,45 @@ enum Objective {
 
 ### 3.2 提交结果
 
-`submit` 同步完成准入校验与初始风控，返回四态结果：
+`submit` 同步完成准入校验与初始风控，返回五态结果：
 
 ```rust
 enum SubmitOutcome {
-    Accepted(ExecutionHandle),       // 已接受为执行任务；成交异步进行
+    Accepted(ExecutionHandle),       // 已接受为执行任务并持久化；成交异步进行
+    Preview(DryRunReport),           // dry_run：返回计划与风控结论，不产生任务
     Rejected(Rejection),             // 明确拒绝，未产生任何任务
-    OutcomeUnknown(IntentId),        // 提交结果未知
-    Conflict(IdempotencyConflict),   // 相同 ID 但内容不同
+    OutcomeUnknown(IntentKey),       // 提交结果未知
+    Conflict(IdempotencyConflict),   // 相同幂等键但内容不同
+}
+
+/// OutcomeUnknown 的恢复凭据；幂等作用域是二元组，缺一不可
+struct IntentKey {
+    owner:     OwnerScope,
+    intent_id: IntentId,
+}
+
+struct DryRunReport {
+    accepted:        bool,                  // 是否通过准入与风控
+    rejections:      Vec<Rejection>,        // 未通过的原因，可能多条
+    risk_assessment: RiskAssessment,        // 预留估算、额度占用、账户级影响
+    plan:            Option<ExecutionPlan>, // 通过时才有
+    as_of:           Timestamp,
+}
+
+struct ExecutionPlan {
+    slices:         Vec<PlannedSlice>,   // 每片：预计时间窗、数量、子单策略、保护价
+    estimated_cost: Option<Amount>,      // None = 无法估算；Some(0) = 明确为零
+    warnings:       Vec<PlanWarning>,    // 精度舍入、低于最小名义、数量尾差等
 }
 ```
 
 **`Accepted` 不代表已成交、不代表子单已发出**，只代表意图通过准入与初始风控并被持久化。这与 P1 一致：既不把"不知道"压缩成"失败"，也不把"已接受"膨胀成"已成交"。
 
-**`OutcomeUnknown` 时业务只能用同一 `IntentId` 查询，禁止换 ID 重发**——换 ID 重发是重复下单的主要来源。恢复方式见 §3.3 的 `find_by_intent`。
+**`Preview` 只在 `dry_run: true` 时出现**——它与 `Accepted` 互斥，因为 dry-run 刻意不产生持久化任务。这样业务拿到的一定是明确的一类结果，不必自己判断"Accepted 里的任务到底是不是真的"。
+
+**`OutcomeUnknown` 时业务只能用同一个 `IntentKey` 查询，禁止换 ID 重发**——换 ID 重发是重复下单的主要来源。恢复方式见 §3.3 的 `find_by_intent`。
+
+`estimated_cost` 同样区分 `None`（无法估算）与 `Some(0)`（明确为零），与 §3.4 的费用语义一致。
 
 gRPC 对应 `SubmitIntentResponse`，同一套语义，不做二次映射。
 
@@ -179,7 +210,15 @@ gRPC 对应 `SubmitIntentResponse`，同一套语义，不做二次映射。
 ```rust
 impl ExecutionClient {
     /// 从幂等键恢复句柄 —— OutcomeUnknown 后的唯一安全恢复方式
-    async fn find_by_intent(&self, intent_id: IntentId) -> Result<Option<ExecutionHandle>>;
+    ///
+    /// 幂等作用域是 (OwnerScope, IntentId) 二元组，必须完整提供：
+    /// 不同策略完全可能使用相同的 IntentId，只传 IntentId 无法唯一确定该恢复哪个任务。
+    /// **客户端不隐式绑定 OwnerScope**，每次查询显式携带，避免跨策略误恢复。
+    async fn find_by_intent(
+        &self,
+        owner:     OwnerScope,
+        intent_id: IntentId,
+    ) -> Result<Option<ExecutionHandle>>;
 }
 
 impl ExecutionHandle {
@@ -274,7 +313,15 @@ struct Fill {
 
 ### 3.8 其他调用语义
 
-**有效期与到期行为**。`valid_until` 是意图级有效期，`leg.deadline` 是单腿更早的额外约束（可选）。到达截止时间仍未完成时按 `on_deadline` 处置：
+**软目标与硬截止必须分开**，两者不可混为一谈：
+
+| 字段 | 性质 | 含义 |
+| --- | --- | --- |
+| `target_completion` | **软** | 希望在此之前完成；未达成即触发 `on_deadline` |
+| `leg.deadline` | **硬（腿级）** | 该腿更早的截止时间；必须 ≤ 意图 `hard_deadline`，提交时校验 |
+| `hard_deadline` | **硬（意图级）** | 授权边界；到达后一律停止新增子单 |
+
+`on_deadline` 只作用于**软目标未达成**的情形：
 
 | `DeadlineAction` | 行为 |
 | --- | --- |
@@ -282,9 +329,11 @@ struct Fill {
 | `CompleteAggressively` | 放宽紧迫度追完剩余（**仍受价格保护上限约束**） |
 | `KeepWorking` | 继续按原节奏挂单 |
 
-**必须由业务显式选择，不设默认值**——三种行为对应的资金后果完全不同，替业务选就是替业务承担风险。
+**任何 `DeadlineAction` 都不得突破 `hard_deadline`**——它是授权边界，不是执行目标。`KeepWorking` 与 `CompleteAggressively` 只决定"到达软目标后要不要更激进"，不等于"可以一直执行下去"。到达硬截止后只保留三类动作：已发送订单的回报归集、必要的撤单、预授权的补偿（§8.3）。
 
-**`dry_run`**。完整执行准入校验、风控评估、算法切片与价格保护计算，**但不发送任何命令、不产生持久化任务**；返回执行计划（切片数、各片预测量、预估成本）与风控结论。**不保证与真实成交一致，不得用于成本核算。**
+**`on_deadline` 必须由业务显式选择，不设默认值**——三种行为对应的资金后果完全不同，替业务选就是替业务承担风险。
+
+**`dry_run`**。完整执行准入校验、风控评估、算法切片与价格保护计算，**但不发送任何命令、不产生持久化任务**；结果通过 `SubmitOutcome::Preview(DryRunReport)` 返回（见 §3.2），因此与 `Accepted` 互斥。**不保证与真实成交一致，其中的预估成本不得用于成本核算。**
 
 **并发提交**。同一账户的多个意图可并发提交，风控预留串行化执行（§9）。额度按提交顺序竞争，不足时返回 `QuotaExceeded`。意图之间互不阻塞，但可能因额度竞争被拒。
 
@@ -311,7 +360,7 @@ let intent = OrderIntent {
             route:       RouteId::from("binance-pm-perp-btc"),
             delta:       LegDelta::ContractPosition {
                 position_side:  PositionSide::Long,
-                contract_delta: ContractDelta::from_str("1.5")?,   // 开多 1.5 张
+                contract_delta: ContractDelta::from_str("1.5")?,   // 开多 1.5 张（Long 槽正增量）
             },
             price_guard: PriceGuard::MaxSlippageBps(10),
             deadline:    None,
@@ -320,7 +369,7 @@ let intent = OrderIntent {
             route:       RouteId::from("binance-pm-perp-eth"),
             delta:       LegDelta::ContractPosition {
                 position_side:  PositionSide::Short,
-                contract_delta: ContractDelta::from_str("-30")?,   // 开空 30 张
+                contract_delta: ContractDelta::from_str("30")?,    // 开空 30 张（Short 槽正增量）
             },
             price_guard: PriceGuard::MaxSlippageBps(10),
             deadline:    None,
@@ -333,21 +382,23 @@ let intent = OrderIntent {
         failure_policy:    FailurePolicy::Compensate(Compensation::UnwindFilledLeg),
         ..Default::default()
     },
-    profile:     Some(ProfileRef::from("hedge-perp-ioc-v1")),
-    valid_until: deadline,
-    on_deadline: DeadlineAction::CancelRest,
-    dry_run:     false,
+    profile:           Some(ProfileRef::from("hedge-perp-ioc-v1")),
+    target_completion: Some(soft_deadline),          // 软目标：尽力在此之前完成
+    hard_deadline:     hard_deadline,                // 硬截止：到点一律停止新增子单
+    on_deadline:       DeadlineAction::CancelRest,   // 软目标未达成则撤单留仓
+    dry_run:           false,
 };
 
-// 提交：同步返回四态之一
+// 提交：同步返回五态之一
 let handle = match client.submit(intent).await? {
     SubmitOutcome::Accepted(h)   => h,
+    SubmitOutcome::Preview(p)    => return Err(anyhow!("unexpected dry-run report: {p:?}")),
     SubmitOutcome::Rejected(r)   => return Err(anyhow!("rejected: {r:?}")),
     SubmitOutcome::Conflict(c)   => return Err(anyhow!("idempotency conflict: {c:?}")),
-    SubmitOutcome::OutcomeUnknown(id) => {
-        // 关键：只能用同一 ID 恢复，禁止换 ID 重发
-        client.find_by_intent(id).await?
-            .ok_or(anyhow!("cannot resolve unknown outcome for {id}"))?
+    SubmitOutcome::OutcomeUnknown(key) => {
+        // 关键：只能用同一个 (owner, intent_id) 恢复，禁止换 ID 重发
+        client.find_by_intent(key.owner, key.intent_id).await?
+            .ok_or(anyhow!("cannot resolve unknown outcome for {:?}", key.intent_id))?
     }
 };
 
@@ -371,8 +422,8 @@ for leg in &snap.legs {
 
 ```protobuf
 service Execution {
-  rpc SubmitIntent(SubmitIntentRequest)      returns (SubmitIntentResponse);   // 内含 outcome 四态
-  rpc FindByIntent(FindByIntentRequest)      returns (TaskSnapshot);
+  rpc SubmitIntent(SubmitIntentRequest)      returns (SubmitIntentResponse);   // 内含 outcome 五态
+  rpc FindByIntent(FindByIntentRequest)      returns (TaskSnapshot);           // 必须携带 owner
   rpc GetTask(GetTaskRequest)                returns (TaskSnapshot);
   rpc CancelIntent(CancelIntentRequest)      returns (CancelReceipt);
   rpc StreamFills(StreamFillsRequest)        returns (stream FillEvent);
